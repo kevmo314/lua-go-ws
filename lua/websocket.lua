@@ -1,4 +1,89 @@
+local json = require("lua.json")
 local Websocket = {}
+
+-- Platform detection using os.getenv and basic detection
+local function detect_platform()
+    local path_sep = package.config:sub(1,1)
+    if path_sep == '\\' then
+        return "windows"
+    end
+    
+    -- Try to detect based on environment variables
+    if os.getenv("OSTYPE") then
+        local ostype = os.getenv("OSTYPE"):lower()
+        if ostype:match("darwin") then
+            return "darwin"
+        elseif ostype:match("linux") then  
+            return "linux"
+        end
+    end
+    
+    -- Fallback detection
+    local handle = io.popen("uname -s 2>/dev/null")
+    if handle then
+        local uname = handle:read("*a"):lower():gsub("%s+$", "")
+        handle:close()
+        if uname:match("darwin") then
+            return "darwin"
+        elseif uname:match("linux") then
+            return "linux"
+        end
+    end
+    
+    return "linux" -- default fallback
+end
+
+local function detect_arch()
+    -- Try environment variable first
+    local arch = os.getenv("HOSTTYPE") or os.getenv("MACHTYPE")
+    if arch then
+        if arch:match("x86_64") or arch:match("amd64") then
+            return "x86_64"
+        end
+    end
+    
+    -- Try uname
+    local handle = io.popen("uname -m 2>/dev/null")
+    if handle then
+        local machine = handle:read("*a"):gsub("%s+$", "")
+        handle:close()
+        if machine:match("x86_64") or machine:match("amd64") then
+            return "x86_64"
+        end
+    end
+    
+    return "arm64" -- default fallback
+end
+
+-- Platform detection for binary selection
+local function pick_binary()
+    local platform = detect_platform()
+    local arch = detect_arch()
+
+    local binaries = {
+        darwin = {
+            x86_64 = "/dist/go-ws-proxy-darwin-amd64",
+            default = "/dist/go-ws-proxy-darwin-arm64",
+        },
+        linux = {
+            x86_64 = "/dist/go-ws-proxy-linux-amd64",
+            default = "/dist/go-ws-proxy-linux-arm64",
+        },
+        windows = {
+            x86_64 = "/dist/go-ws-proxy-windows-amd64",
+            default = "/dist/go-ws-proxy-windows-arm64",
+        },
+    }
+
+    if binaries[platform] then
+        if type(binaries[platform]) == "table" then
+            return binaries[platform][arch] or binaries[platform].default
+        end
+        return binaries[platform]
+    end
+
+    return ""
+end
 
 -- Reconnection settings
 local reconnect_attempts = 0
@@ -9,6 +94,22 @@ local reconnect_delay = 1000
 local websocket_job = nil
 local message_handlers = {}
 local status_callbacks = {}
+
+-- Process management interface - must be provided by caller
+Websocket.process = {
+    -- spawn(command_args, callbacks) -> job_id
+    -- callbacks: { on_stdout, on_stderr, on_exit }
+    spawn = nil,
+    
+    -- send(job_id, message) -> boolean
+    send = nil,
+    
+    -- kill(job_id) -> boolean  
+    kill = nil,
+    
+    -- defer(callback, delay_ms)
+    defer = nil
+}
 
 -- Logging interface - consumers can override
 Websocket.log = {
@@ -26,42 +127,6 @@ Websocket.Status = {
 }
 
 local current_status = Websocket.Status.DISCONNECTED
-
--- Platform detection for binary selection
-local function pick_binary()
-    local uv = vim.uv or vim.loop
-    local uname = uv.os_uname()
-    local sysname = uname.sysname:lower()
-    local arch = uname.machine
-
-    local binaries = {
-        darwin = {
-            x86_64 = "/dist/go-ws-proxy-darwin-amd64",
-            default = "/dist/go-ws-proxy-darwin-arm64",
-        },
-        linux = {
-            x86_64 = "/dist/go-ws-proxy-linux-amd64",
-            default = "/dist/go-ws-proxy-linux-arm64",
-        },
-        windows = {
-            x86_64 = "/dist/go-ws-proxy-windows-amd64",
-            default = "/dist/go-ws-proxy-windows-arm64",
-        },
-    }
-
-    if binaries[sysname] then
-        if type(binaries[sysname]) == "table" then
-            return binaries[sysname][arch] or binaries[sysname].default
-        end
-        return binaries[sysname]
-    end
-
-    if vim.fn.has("win32") == 1 or vim.fn.has("win64") == 1 then
-        return binaries.windows.default or binaries.windows
-    end
-
-    return ""
-end
 
 -- Status management
 local function set_status(new_status)
@@ -95,26 +160,17 @@ function Websocket.send_message(message)
         return false
     end
 
-    local ok, result = pcall(function()
-        return vim.fn.chansend(websocket_job, message .. "\n")
-    end)
-
-    if not ok then
-        Websocket.log.debug("websocket", "Error sending message: " .. tostring(result))
+    if not Websocket.process.send then
+        Websocket.log.debug("websocket", "send_message not implemented - caller must provide Websocket.process.send")
         return false
     end
 
-    if result == 0 then
-        Websocket.log.debug("websocket", "Failed to send message to websocket")
-        return false
-    end
-
-    return true
+    return Websocket.process.send(websocket_job, message .. "\n")
 end
 
 -- Send a JSON message
 function Websocket.send_json(data)
-    local ok, json_str = pcall(vim.json.encode, data)
+    local ok, json_str = pcall(json.encode, data)
     if not ok then
         Websocket.log.debug("websocket", "Failed to encode JSON: " .. tostring(json_str))
         return false
@@ -150,7 +206,9 @@ end
 function Websocket.shutdown()
     if websocket_job then
         Websocket.log.debug("websocket", "Shutting down websocket process")
-        vim.fn.jobstop(websocket_job)
+        if Websocket.process.kill then
+            Websocket.process.kill(websocket_job)
+        end
         websocket_job = nil
         set_status(Websocket.Status.SHUTDOWN)
     end
@@ -160,100 +218,102 @@ end
 function Websocket.connect(server_uri, options)
     options = options or {}
     
+    if not Websocket.process.spawn then
+        Websocket.log.notify("websocket", "ERROR", true, "Process spawner not configured - caller must provide Websocket.process.spawn")
+        return false
+    end
+    
     Websocket.log.debug("websocket", "Setting up websocket connection")
     set_status(Websocket.Status.CONNECTING)
 
     -- Kill existing connection if there is one
     if websocket_job then
-        vim.fn.jobstop(websocket_job)
+        if Websocket.process.kill then
+            Websocket.process.kill(websocket_job)
+        end
         websocket_job = nil
     end
 
-    -- Get the plugin's root directory
-    local plugin_root = options.plugin_root
-    if not plugin_root then
-        local current_file = debug.getinfo(1, "S").source:sub(2)
-        plugin_root = vim.fn.fnamemodify(current_file, ":h:h")
-    end
+    -- Get the current file directory for binary resolution
+    local current_file = debug.getinfo(1, "S").source:sub(2)
+    local current_dir = current_file:match("(.+)/[^/]*$") or "."
     
-    local binary_path = plugin_root .. pick_binary()
+    local binary_path = current_dir .. "/.." .. pick_binary()
 
-    -- Build the websocket URI with query parameters
+    -- Use the server URI as provided by the caller
     local ws_uri = server_uri
-    if options.user_id then
-        ws_uri = ws_uri .. "?user_id=" .. options.user_id .. "&editor=neovim"
-        if options.api_key and options.api_key ~= "" then
-            ws_uri = ws_uri .. "&api_key=" .. options.api_key
-        end
-    end
 
-    websocket_job = vim.fn.jobstart({
-        binary_path,
-        ws_uri,
-    }, {
-        on_stdout = function(_, data, _)
-            if not data then
-                return
-            end
+    -- Spawn the websocket process using caller-provided function
+    websocket_job = Websocket.process.spawn(
+        { binary_path, ws_uri },
+        {
+            on_stdout = function(data)
+                if not data then
+                    return
+                end
 
-            for _, line in ipairs(data) do
-                if line ~= "" then
-                    Websocket.log.debug("websocket", "Got message line: " .. line)
+                for _, line in ipairs(data) do
+                    if line ~= "" then
+                        Websocket.log.debug("websocket", "Got message line: " .. line)
 
-                    local ok, parsed = pcall(vim.json.decode, line)
-                    if not ok or type(parsed) ~= "table" then
-                        Websocket.log.debug("websocket", "Failed to parse JSON line: " .. line)
-                        goto continue
+                        local ok, parsed = pcall(json.decode, line)
+                        if not ok or type(parsed) ~= "table" then
+                            Websocket.log.debug("websocket", "Failed to parse JSON line: " .. line)
+                        else
+                            handle_message(parsed)
+                        end
                     end
-
-                    handle_message(parsed)
                 end
-                ::continue::
-            end
-        end,
-        on_stderr = function(_, data, _)
-            if data and #data > 0 then
-                local message = table.concat(data, "\n")
-                if message ~= "" then
-                    Websocket.log.debug("websocket", "Connection error: " .. message)
+            end,
+            
+            on_stderr = function(data)
+                if data and #data > 0 then
+                    local message = table.concat(data, "\n")
+                    if message ~= "" then
+                        Websocket.log.debug("websocket", "Connection error: " .. message)
+                    end
+                end
+            end,
+            
+            on_exit = function(exit_code)
+                Websocket.log.debug("websocket", "Websocket connection closed with exit code: " .. exit_code)
+                websocket_job = nil
+
+                -- Don't reconnect if we're shutting down
+                if current_status == Websocket.Status.SHUTDOWN then
+                    return
+                end
+
+                -- Attempt to reconnect if not shutting down intentionally
+                if reconnect_attempts < max_reconnect_attempts then
+                    reconnect_attempts = reconnect_attempts + 1
+                    set_status(Websocket.Status.RECONNECTING)
+
+                    if Websocket.process.defer then
+                        Websocket.process.defer(function()
+                            Websocket.log.debug("websocket", "Reconnecting to websocket...")
+                            Websocket.connect(server_uri, options)
+                        end, reconnect_delay)
+                    else
+                        Websocket.log.debug("websocket", "No defer function provided - cannot reconnect automatically")
+                        set_status(Websocket.Status.DISCONNECTED)
+                    end
+                else
+                    Websocket.log.notify(
+                        "websocket",
+                        "WARN",
+                        true,
+                        "Failed to reconnect after " .. max_reconnect_attempts .. " attempts"
+                    )
+                    reconnect_attempts = 0
+                    set_status(Websocket.Status.DISCONNECTED)
                 end
             end
-        end,
-        on_exit = function(_, exit_code, _)
-            Websocket.log.debug("websocket", "Websocket connection closed with exit code: " .. exit_code)
-            websocket_job = nil
+        }
+    )
 
-            -- Don't reconnect if we're shutting down
-            if current_status == Websocket.Status.SHUTDOWN then
-                return
-            end
-
-            -- Attempt to reconnect if not shutting down intentionally
-            if reconnect_attempts < max_reconnect_attempts then
-                reconnect_attempts = reconnect_attempts + 1
-                set_status(Websocket.Status.RECONNECTING)
-
-                vim.defer_fn(function()
-                    Websocket.log.debug("websocket", "Reconnecting to websocket...")
-                    Websocket.connect(server_uri, options)
-                end, reconnect_delay)
-            else
-                Websocket.log.notify(
-                    "websocket",
-                    vim.log.levels.WARN,
-                    true,
-                    "Failed to reconnect after " .. max_reconnect_attempts .. " attempts"
-                )
-                reconnect_attempts = 0
-                set_status(Websocket.Status.DISCONNECTED)
-            end
-        end,
-        stdout_buffered = false,
-        stderr_buffered = false,
-    })
-
-    if websocket_job <= 0 then
-        Websocket.log.notify("websocket", vim.log.levels.ERROR, true, "Failed to start process")
+    if not websocket_job or websocket_job <= 0 then
+        Websocket.log.notify("websocket", "ERROR", true, "Failed to start process")
         set_status(Websocket.Status.DISCONNECTED)
         return false
     end
@@ -268,6 +328,11 @@ end
 -- Configure logging
 function Websocket.set_logger(logger)
     Websocket.log = logger
+end
+
+-- Configure process management functions
+function Websocket.set_process_manager(process_manager)
+    Websocket.process = process_manager
 end
 
 return Websocket
